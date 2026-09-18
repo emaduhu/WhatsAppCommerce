@@ -1,26 +1,56 @@
-# WhatsApp Commerce API
+# WhatsApp Commerce
 
-Production-oriented multi-tenant Laravel 13 backend for SMEs selling through WhatsApp.
+Production-oriented multi-tenant Laravel 12 frontend and API for SMEs selling through WhatsApp.
 
 ## Included
 
-- Laravel 13 / PHP 8.4 API
+- Laravel 12 / PHP 8.2+ frontend and API
+- Browser console for merchant registration, login, dashboard metrics and product management
 - Laravel Sanctum authentication
 - Multi-tenant merchants and merchant membership authorization
 - Product/service catalog and stock
+- AI sales-agent checkout flow for WhatsApp messages such as `Nataka Samsung A55 blue mbili`
+- Persistent carts and cart items before checkout
 - Customers, conversations and message history
 - Orders, order items and payment state
 - WhatsApp Business Platform / Cloud API integration
+- Meta Embedded Signup as the primary merchant WhatsApp connection flow
 - GET webhook verification + POST `X-Hub-Signature-256` validation
 - Idempotency on WhatsApp message IDs
-- Asynchronous inbound processing and outbound sends with Redis queues
+- Asynchronous inbound processing and outbound sends with database queues on cPanel
 - WhatsApp delivery/read/failure status updates
 - 24-hour customer-service-window protection for free-form outbound text
 - Approved template-message endpoint outside the service window
 - Human handoff (`agent`, `human`, `mtu`, `msaada`)
-- Basic catalog auto-reply engine (replace/extend with your preferred LLM orchestration)
+- Catalog-aware sales replies, delivery capture, mobile-money checkout and payment confirmation
 - Generic payment gateway adapter + signed payment webhook
-- PostgreSQL + Redis + Docker + Nginx + Supervisor
+- MySQL + cPanel cron defaults, with optional Redis/Docker/Nginx/Supervisor assets for later migration
+
+
+## Current production modules
+
+This repository now includes the MVP production backbone for **WhatsApp Commerce for SMEs**:
+
+- merchant registration and Sanctum authentication, including `GET /api/auth/me`
+- tenant isolation middleware on all `/api/merchants/{merchant}` routes
+- categories, products, variants and inventory adjustment APIs
+- inventory movement audit trail through `InventoryService`
+- WhatsApp Embedded Signup onboarding APIs
+- idempotent WhatsApp webhook event storage in `webhook_events`
+- deterministic English/Swahili commerce agent with human handoff
+- carts, checkout, orders and payment initiation
+- idempotent signed payment callbacks stored in `payment_transactions`
+- server-side WhatsApp 24-hour messaging policy enforcement
+- merchant dashboard metrics, recent orders/conversations, payment exceptions and low stock
+- `GET /api/health` for non-secret health checks
+
+Additional documentation:
+
+- [`ARCHITECTURE.md`](ARCHITECTURE.md)
+- [`WHATSAPP_SETUP.md`](WHATSAPP_SETUP.md)
+- [`PAYMENT_SETUP.md`](PAYMENT_SETUP.md)
+- [`AI_AGENT.md`](AI_AGENT.md)
+- [`CPANEL_INSTALL.md`](CPANEL_INSTALL.md)
 
 ## Important production design decision
 
@@ -34,7 +64,7 @@ composer install
 php artisan key:generate
 php artisan migrate
 php artisan serve
-php artisan queue:work redis --tries=8 --timeout=60
+php artisan queue:work database --tries=8 --timeout=60
 ```
 
 For production Docker deployment:
@@ -55,18 +85,22 @@ Do not generate a new `APP_KEY` on every deployment. Generate once and store it 
 
 ## 2. WhatsApp / Meta setup
 
-Create/configure a Meta app with WhatsApp Business Platform and obtain:
+Create/configure a platform-owned Meta app with WhatsApp Business Platform and Embedded Signup. The platform needs:
 
-- WhatsApp Business Account ID (`waba_id`)
-- Phone Number ID
-- production System User access token with required WhatsApp permissions
+- Meta App ID
 - Meta App Secret
+- Embedded Signup configuration ID
 - a private webhook verify token of your own choosing
+
+Individual SMEs do not paste WABA IDs, Phone Number IDs or long-lived access tokens into this app. Each merchant connects their own WhatsApp Business account and number from the dashboard through Embedded Signup. Laravel exchanges the returned authorization code, reads the authorized phone numbers, subscribes the WABA to webhooks, and stores the merchant token encrypted.
 
 Set:
 
 ```env
 WHATSAPP_GRAPH_VERSION=v26.0
+WHATSAPP_APP_ID=<meta-app-id>
+WHATSAPP_EMBEDDED_SIGNUP_CONFIG_ID=<embedded-signup-configuration-id>
+WHATSAPP_EMBEDDED_SIGNUP_CALLBACK_URL=https://wc.vigourtech.net
 WHATSAPP_WEBHOOK_VERIFY_TOKEN=<strong-random-value>
 WHATSAPP_APP_SECRET=<meta-app-secret>
 WHATSAPP_ENFORCE_SIGNATURE=true
@@ -77,7 +111,7 @@ The API version is intentionally configurable. Confirm Meta's currently supporte
 Configure the Meta webhook callback URL:
 
 ```text
-https://api.yourdomain.tld/api/webhooks/whatsapp
+https://wc.vigourtech.net/api/webhooks/whatsapp
 ```
 
 Use your `WHATSAPP_WEBHOOK_VERIFY_TOKEN` as the verify token and subscribe the WhatsApp Business Account to at least the `messages` webhook field.
@@ -106,7 +140,30 @@ Content-Type: application/json
 
 The response returns a Sanctum bearer token and merchant.
 
-## 4. Connect a WhatsApp number
+## 4. Merchant WhatsApp self-onboarding
+
+The dashboard includes a **WhatsApp Connection** panel. A merchant logs in, chooses their merchant profile, enters their WhatsApp number, optionally enters a 6-digit registration PIN, and clicks **Connect with Meta**. Meta Embedded Signup opens in a popup so the merchant can authorize the business, WABA and phone number.
+
+After Meta returns the authorization code, Laravel automatically:
+
+1. exchanges the code for the business integration system-user token,
+2. reads the authorized WABA and phone-number list,
+3. matches the entered WhatsApp number and stores its Phone Number ID,
+4. configures the Meta app webhook subscription for `https://wc.vigourtech.net/api/webhooks/whatsapp`,
+5. subscribes the WABA to `messages` webhooks,
+6. registers the phone number on Cloud API when requested, using the merchant PIN or an auto-generated 6-digit PIN,
+7. stores the WhatsApp account and encrypted token against the merchant.
+
+The backend endpoints are:
+
+```text
+GET  /api/merchants/{merchant}/whatsapp/onboarding/config
+POST /api/merchants/{merchant}/whatsapp/onboarding/complete
+```
+
+Meta still requires the platform owner to create the Meta app and Embedded Signup configuration first. Laravel cannot create those without access to the platform owner's Meta developer account.
+
+Manual connection remains available for admin/operator migrations only:
 
 ```http
 POST /api/merchants/{merchant}/whatsapp/accounts
@@ -125,10 +182,16 @@ Content-Type: application/json
 ## 5. Product API
 
 ```text
+GET    /api/merchants/{merchant}/categories
+POST   /api/merchants/{merchant}/categories
 GET    /api/merchants/{merchant}/products
 POST   /api/merchants/{merchant}/products
+GET    /api/merchants/{merchant}/products/{product}
 PATCH  /api/merchants/{merchant}/products/{product}
 DELETE /api/merchants/{merchant}/products/{product}
+POST   /api/merchants/{merchant}/products/{product}/variants
+PATCH  /api/merchants/{merchant}/products/{product}/variants/{variant}
+POST   /api/merchants/{merchant}/products/{product}/inventory/adjust
 ```
 
 Example create payload:
@@ -157,7 +220,29 @@ PATCH /api/merchants/{merchant}/orders/{order}/status
 
 Creating an order locks product rows during stock validation and decrements tracked stock atomically.
 
-## 7. Sending WhatsApp messages
+## 7. WhatsApp sales agent
+
+Inbound customer messages are processed by `SalesAgent`. For example:
+
+```text
+Nataka Samsung A55 blue mbili
+```
+
+The agent:
+
+1. extracts the requested product and quantity,
+2. searches the active merchant catalog,
+3. checks tracked inventory,
+4. creates or updates a cart,
+5. asks for the delivery location,
+6. asks for a mobile-money number or CASH,
+7. creates the order and payment record,
+8. initiates the configured payment provider, and
+9. sends WhatsApp status/confirmation messages.
+
+If `PAYMENT_BASE_URL` is not configured, the order is still created and the customer is told that a staff member will complete payment. Configure the provider settings before treating mobile-money initiation as live.
+
+## 8. Sending WhatsApp messages
 
 Within the active customer-service window:
 
@@ -189,7 +274,7 @@ POST /api/merchants/{merchant}/whatsapp/messages/template
 
 Template names, categories, languages and components must match templates approved in WhatsApp Manager.
 
-## 8. Payment provider
+## 9. Payment provider
 
 This repository intentionally isolates payment-provider-specific logic in `GenericPaymentGateway`. Configure:
 
@@ -198,7 +283,7 @@ PAYMENT_PROVIDER=your-provider
 PAYMENT_BASE_URL=https://provider.example/api
 PAYMENT_API_KEY=...
 PAYMENT_WEBHOOK_SECRET=...
-PAYMENT_CALLBACK_URL=https://api.yourdomain.tld/api/webhooks/payments/generic
+PAYMENT_CALLBACK_URL=https://wc.vigourtech.net/api/webhooks/payments/generic
 ```
 
 Expected generic initiation contract:
@@ -229,26 +314,26 @@ Webhook signature: lowercase hex HMAC-SHA256 of the raw body in `X-Signature`.
 
 **Adapt this gateway to the exact provider contract before going live.** Do not accept unsigned callbacks.
 
-## 9. Production checklist
+## 10. Production checklist
 
 1. Put TLS in front of the service and redirect HTTP to HTTPS.
 2. Set `APP_ENV=production`, `APP_DEBUG=false`.
-3. Store `APP_KEY`, DB password, Meta App Secret, WhatsApp tokens and payment secrets in a secret manager.
-4. Use a permanent/System User token appropriate for production rather than a temporary getting-started token.
+3. Store `APP_KEY`, DB password, Meta App Secret, encrypted merchant WhatsApp tokens and payment secrets in a secret manager or encrypted database backup workflow.
+4. Use Meta Embedded Signup in production mode so merchant Business Integration System User tokens are issued through Meta's authorization flow.
 5. Keep `WHATSAPP_ENFORCE_SIGNATURE=true`.
 6. Restrict `CORS_ALLOWED_ORIGINS` to your real dashboard origins.
 7. Run `php artisan migrate --force` during controlled releases.
 8. Run `php artisan optimize` after deployment.
-9. Keep Redis persistent/managed and monitor failed queue jobs.
+9. Keep the cPanel database queue cron active and monitor failed queue jobs.
 10. Add centralized logs/metrics/alerts for webhook failures, queue lag, WhatsApp 4xx/5xx and payment callback failures.
-11. Back up PostgreSQL and test restores.
-12. Configure database connection limits and reverse-proxy/API rate limits.
+11. Back up MySQL and test restores.
+12. Configure database connection limits and API rate limits.
 13. Add your payment provider's exact replay protection/idempotency key rules.
 14. Implement customer consent and approved templates for marketing communications.
 15. Add retention/deletion rules for customer PII and message payloads.
-16. Before scale, replace the simple keyword catalog responder with a tool-calling AI layer that can only read authoritative catalog/order functions.
+16. Before scale, replace the deterministic parser with a tool-calling LLM layer that can only use authoritative catalog/cart/order/payment functions.
 
-## 10. Architecture
+## 11. Architecture
 
 ```text
 Customer WhatsApp
@@ -258,30 +343,44 @@ Meta WhatsApp Cloud API
        |
        | webhook
        v
-Nginx -> Laravel API -> Redis Queue -> Webhook Processor
-                         |                |
-                         |                +-> Customers / Conversations / Messages
-                         |                +-> Catalog intent
-                         |                +-> Human handoff
-                         |
-                         +-> Outbound WhatsApp Jobs -> Graph API
+Apache/cPanel -> Laravel API -> Database Queue -> Webhook Processor
+                                  |                |
+                                  |                +-> Customers / Conversations / Messages
+                                  |                +-> Sales agent / carts / checkout
+                                  |                +-> Human handoff
+                                  |
+                                  +-> Outbound WhatsApp Jobs -> Graph API
 
 Dashboard / Mobile App -> Sanctum -> Merchant-scoped APIs
                                       |
                                       +-> Products / stock
                                       +-> Orders
                                       +-> Payments
-                                      +-> WhatsApp sends/templates
+                                      +-> Embedded Signup / WhatsApp sends/templates
 
-PostgreSQL = authoritative commerce data
-Redis      = queues/cache
+MySQL = authoritative commerce data
+cPanel cron + database queue = background processing
 ```
 
-## 11. What still must be configured for a real launch
+## 12. Health and release checks
 
-No repository can contain your production Meta or payment credentials. Before launch you must supply the real WhatsApp Business Account/Phone Number IDs, approved templates, System User token, App Secret, DNS/TLS domain, payment aggregator credentials and provider-specific payload mapping.
+```text
+GET /api/health
+```
 
-The included catalog auto-reply is deliberately deterministic. It demonstrates the full inbound -> DB lookup -> queued outbound path without allowing an LLM to invent price/stock. An LLM can be added later behind a strict tool layer.
+A cPanel-safe release check is available for operators:
+
+```bash
+php scripts/cpanel_release_check.php
+```
+
+It verifies core environment values and database reachability without printing secrets.
+
+## 13. What still must be configured for a real launch
+
+No repository can contain your production Meta or payment credentials. Before launch you must supply the real platform Meta App ID, Meta App Secret, Embedded Signup configuration ID, approved templates, DNS/TLS domain, payment aggregator credentials and provider-specific payload mapping. Each merchant supplies their own WhatsApp Business authorization through Embedded Signup.
+
+The included sales-agent parser is deliberately deterministic. It demonstrates the full inbound -> catalog lookup -> cart -> checkout -> queued outbound path without allowing an LLM to invent price/stock. An LLM can be added later behind a strict tool layer.
 
 ---
 
